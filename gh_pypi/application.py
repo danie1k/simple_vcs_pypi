@@ -29,7 +29,7 @@ CACHE_KEY = 'repositories'
 
 
 # noinspection PyMethodMayBeStatic,PyProtectedMember,PyUnusedLocal,SpellCheckingInspection
-class WsgiApplication(github.GitHub):
+class WsgiApplication(github.GitHub):  # pylint:disable=too-many-instance-attributes
     _URLS = routing.Map((
         routing.Rule('/', endpoint='index'),
         routing.Rule('/<repository_name>/', endpoint='repository'),
@@ -164,19 +164,7 @@ class WsgiApplication(github.GitHub):
             raise exceptions.NotFound()
 
         wanted_release = repo_releases[release_name]  # type: release.Release
-        asset_url = None
-        for asset in wanted_release.assets():  # type: release.Asset
-            if asset.name == ASSET_FILENAME:
-                asset_url = '{download_url}?access_token={access_token}'.format(
-                    download_url=asset.download_url,
-                    access_token=self._auth.get('token', self._auth.get('password')),
-                )
-                break
-
-        if not asset_url:
-            raise exceptions.NotFound(
-                'Asset "{}" not found in release "{}"'.format(ASSET_FILENAME, wanted_release.name)
-            )
+        asset_url = self._find_release_download_link(wanted_release)  # type: str
 
         with requests.get(asset_url, headers={'Accept': 'application/octet-stream'}, stream=True) as tarball:
             if tarball.status_code != HTTPStatus.OK:
@@ -254,3 +242,24 @@ class WsgiApplication(github.GitHub):
             for item in sorted(repository.releases(), key=lambda item: item.created_at)
         )
         return repo_releases or None
+
+    def _find_release_download_link(self, release_instance):
+        """
+        :type: release.Release
+        :rtype: str
+        :raises werkzeug.exceptions.NotFound:
+        """
+        asset_url = None
+        for asset in release_instance.assets():  # type: release_instance.Asset
+            if asset.name == ASSET_FILENAME:
+                asset_url = '{download_url}?access_token={access_token}'.format(
+                    download_url=asset.download_url,
+                    access_token=self._auth.get('token', self._auth.get('password')),
+                )
+                break
+
+        if not asset_url:
+            raise exceptions.NotFound(
+                'Asset "{}" not found in release "{}"'.format(ASSET_FILENAME, release_instance.name)
+            )
+        return asset_url

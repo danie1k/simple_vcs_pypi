@@ -6,7 +6,7 @@ from io import (
 )
 
 
-class ResponseStream(object):
+class ResponseStream:
     def __init__(self, request_iterator):
         self._bytes = BytesIO()
         self._iterator = request_iterator
