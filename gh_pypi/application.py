@@ -1,20 +1,14 @@
 from cachelib import FileSystemCache
-from github3 import login
-from github3.exceptions import AuthenticationFailed
-from github3.repos.repo import ShortRepository
-from werkzeug.exceptions import (
-    Forbidden,
-    HTTPException,
-    NotFound,
-    Unauthorized,
+from github3 import (
+    exceptions as gh_exc,
+    login,
+    repos,
 )
-from werkzeug.routing import (
-    Map,
-    Rule,
-)
-from werkzeug.wrappers import (
-    Request,
-    Response,
+from github3.repos import release
+from werkzeug import (
+    exceptions,
+    routing,
+    wrappers,
 )
 
 from . import (
@@ -25,20 +19,22 @@ from . import (
 __all__ = ('WsgiApplication', )
 
 
+# noinspection PyMethodMayBeStatic,PyProtectedMember,PyUnusedLocal,SpellCheckingInspection
 class WsgiApplication(github.GitHub):
-    _cache = None  # type: FileSystemCache
-    _urls = Map((
-        Rule('/', endpoint='index'),
-        Rule('/<repository_name>/', endpoint='repository'),
+    _urls = routing.Map((
+        routing.Rule('/', endpoint='index'),
+        routing.Rule('/<repository_name>/', endpoint='repository'),
     ))
-    _users_and_organizations = None  # type: tuple[github.Organization | github.User]
+
+    _cache = None  # type: FileSystemCache
+    _users_and_organizations = None  # type: (github.Organization | github.User, ...)
     _index_template = None  # type: str
     _repository_template = None  # type: str
 
     @property
     def repositories(self):
         """
-        :rtype dict[github3.repos.repo.ShortRepository]
+        :rtype: dict[repos.ShortRepository]
         """
         value = self._cache.get('repositories')
 
@@ -48,18 +44,17 @@ class WsgiApplication(github.GitHub):
             self._cache.set('repositories', value)
             return data
 
-        return {key: ShortRepository(json, self.github_api.session) for key, json in value.items()}
+        return {key: repos.ShortRepository(json, self.github_api.session) for key, json in value.items()}
 
     def __init__(
-        self,
-        *users_and_organizations,
-        cache_dir,  # Should be an absolute path!
-        index_template=None,
-        repository_template=None,
+            self,
+            *users_and_organizations,
+            cache_dir,  # Should be an absolute path!
+            index_template=None,
+            repository_template=None,
     ) -> None:
         """
-        :type users_and_organizations: github.Organization | github.User
-        :type users_and_organizations: str
+        :type users_and_organizations: (github.Organization | github.User, ...)
         :type index_template: str
         :type repository_template: str
         :rtype: None
@@ -75,56 +70,62 @@ class WsgiApplication(github.GitHub):
         :type start_response: werkzeug.serving.WSGIRequestHandler.start_response
         :rtype: werkzeug.wsgi.ClosingIterator
         """
-        request = Request(environ)
+        request = wrappers.Request(environ)
         try:
             auth = self._get_authorization(request)
-            self._authorize_github(auth.get('username'), auth.get('password'))
+            self._authorize_github(**auth)
 
             adapter = self._urls.bind_to_environ(request.environ)
             endpoint, values = adapter.match()
 
             func_name = 'dispatch_{}'.format(endpoint)
-            response = getattr(self, func_name)(request, **values) if hasattr(self, func_name) else NotFound()
-        except HTTPException as ex:
+            response = (
+                getattr(self, func_name)(request, **values) if hasattr(self, func_name)
+                else exceptions.NotFound()
+            )
+        except exceptions.HTTPException as ex:
             response = ex
 
         return response(environ, start_response)
 
-    def _authorize_github(self, username, password):
+    def _authorize_github(self, **auth):
         """
-        :type username: str
-        :type password: str
+        :type auth: str
         :rtype: None
+        :raises werkzeug.exceptions.Forbidden: If cannot login to GitHub using `auth` credentials
         """
-        self.github_api = login(username=username, password=password)
-
+        self.github_api = login(**auth)
         try:
             if self.github_api.me() is None:
-                raise Forbidden()
-        except AuthenticationFailed:
-            raise Forbidden()
+                raise exceptions.Forbidden()
+        except gh_exc.AuthenticationFailed:
+            raise exceptions.Forbidden()
 
     def _get_authorization(self, request):
         """
         :type request: werkzeug.wrappers.request.Request
         :rtype: dict[str]
+        :raises werkzeug.exceptions.Unauthorized: If authorization information not available in `request`
         """
-        auth = request.authorization
-
+        auth = request.authorization or {}
         if not (auth.get('username', None) and auth.get('password', None)):
-            raise Unauthorized(www_authenticate='Basic realm=\'Simple index\'')
+            raise exceptions.Unauthorized(www_authenticate='Basic realm=\'Simple index\'')
 
         return auth
+
+    # Endpoints
 
     def dispatch_index(self, request):  # pylint:disable=unused-argument
         """
         :type request: werkzeug.wrappers.request.Request
         :rtype: werkzeug.wrappers.response.Response
         """
-        return Response(
+        return wrappers.Response(
             self._index_template % {
-                'links':
-                    '\n'.join('<a href="%(name)s/">%(name)s</a>' % {'name': repo} for repo in self.repositories.keys()),
+                'links': '\n'.join(
+                    '<a href="s%(name)s/">%(name)s</a>' % {'name': repo}
+                    for repo in self.repositories.keys()
+                ),
             },
             mimetype='text/html',
         )
@@ -137,55 +138,53 @@ class WsgiApplication(github.GitHub):
         :raises werkzeug.exceptions.NotFound: If `repository_name` not found on GitHub
         """
         try:
-            repository = self.repositories[repository_name]  # type: github3.repos.repo.ShortRepository
+            repository = self.repositories[repository_name]  # type: repos.ShortRepository
         except KeyError:
-            raise NotFound()
+            raise exceptions.NotFound()
 
         releases = self._get_repo_releases(repository)
         if not releases:
-            return Response('No releases available for this repository', mimetype='text/html')
+            return wrappers.Response('No releases available for this repository', mimetype='text/html')
 
-        return Response(
+        return wrappers.Response(
             self._repository_template % {
                 'repository_name': repository.name,
-                'links': '\n'.join('<a href="%(url)s">%(name)s</a>' % item for item in releases),
+                'links': '\n'.join('<a href="s%(url)s">%(name)s</a>' % item for item in releases),
             },
             mimetype='text/html',
         )
 
     def _get_repo_releases(self, repository):
         """
-        :type repository: type: github3.repos.repo.ShortRepository
-        :rtype: tuple[dict] | None
+        :type repository: repos.ShortRepository
+        :rtype: (dict[str], ...) | None
         """
-        repo_releases = sorted(
-            repository.releases(), key=lambda item: item.created_at
-        )  # type: list[github3.repos.release.Release]
+        repo_releases = sorted(repository.releases(), key=lambda item: item.created_at)  # type: [release.Release, ...]
         if not repo_releases:
             return None
         return (
-            self._get_private_repo_releases(repository, repo_releases)
-            if repository.private else self._get_public_repo_releases(repository, repo_releases)
+            self._get_private_repo_releases(repository, repo_releases) if repository.private
+            else self._get_public_repo_releases(repository, repo_releases)
         )
 
     def _get_public_repo_releases(self, repository, releases):
         """
-        :type repository: type: github3.repos.repo.ShortRepository
-        :type releases: list[github3.repos.release.Release]
-        :rtype: tuple[dict] | None
+        :type repository: type: github3.repos.repo.repos.ShortRepository
+        :type releases: [release.Release, ...]
+        :rtype: (dict[str], ...) | None
         """
         return tuple({
-            'url':
-                '{url}/archive/{tag_name}.tar.gz'
-                .format(url=repository.html_url.rstrip('/'), tag_name=release.tag_name),
-            'name':
-                release.tag_name
-        } for release in releases)
+            'url': '{url}/archive/{tag_name}.tar.gz'.format(
+                url=repository.html_url.rstrip('/'),
+                tag_name=item.tag_name,
+            ),
+            'name': item.tag_name
+        } for item in releases)
 
     def _get_private_repo_releases(self, repository, releases):
         """
-        :type repository: type: github3.repos.repo.ShortRepository
-        :type releases: list[github3.repos.release.Release]
+        :type repository: type: github3.repos.repo.repos.ShortRepository
+        :type releases: [release.Release, ...]
         :rtype: dict
         """
         raise NotImplementedError
