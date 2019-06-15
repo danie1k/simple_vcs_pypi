@@ -1,3 +1,5 @@
+from urllib import parse
+
 from cachelib import FileSystemCache
 from github3 import (
     exceptions as gh_exc,
@@ -30,6 +32,7 @@ class WsgiApplication(github.GitHub):
     _users_and_organizations = None  # type: (github.Organization | github.User, ...)
     _index_template = None  # type: str
     _repository_template = None  # type: str
+    _request_domain = None  # type: str
 
     @property
     def repositories(self):
@@ -63,6 +66,8 @@ class WsgiApplication(github.GitHub):
         self._users_and_organizations = users_and_organizations
         self._index_template = index_template or templates.INDEX
         self._repository_template = repository_template or templates.REPOSITORY
+        # noinspection PyTypeChecker
+        self._request_domain = None
 
     def __call__(self, environ, start_response):
         """
@@ -74,6 +79,7 @@ class WsgiApplication(github.GitHub):
         try:
             auth = self._get_authorization(request)
             self._authorize_github(**auth)
+            self._request_domain = self._get_request_domain(request, **auth)
 
             adapter = self._urls.bind_to_environ(request.environ)
             endpoint, values = adapter.match()
@@ -87,19 +93,6 @@ class WsgiApplication(github.GitHub):
             response = ex
 
         return response(environ, start_response)
-
-    def _authorize_github(self, **auth):
-        """
-        :type auth: str
-        :rtype: None
-        :raises werkzeug.exceptions.Forbidden: If cannot login to GitHub using `auth` credentials
-        """
-        self.github_api = login(**auth)
-        try:
-            if self.github_api.me() is None:
-                raise exceptions.Forbidden()
-        except gh_exc.AuthenticationFailed:
-            raise exceptions.Forbidden()
 
     def _get_authorization(self, request):
         """
@@ -115,6 +108,29 @@ class WsgiApplication(github.GitHub):
 
         return {'username': username, 'password': password} if username and password else {'token': username}
 
+    def _authorize_github(self, **auth):
+        """
+        :type auth: str
+        :rtype: None
+        :raises werkzeug.exceptions.Forbidden: If cannot login to GitHub using `auth` credentials
+        """
+        self.github_api = login(**auth)
+        try:
+            if self.github_api.me() is None:
+                raise exceptions.Forbidden()
+        except gh_exc.AuthenticationFailed:
+            raise exceptions.Forbidden()
+
+    def _get_request_domain(self, request, **auth):
+        """
+        :type request: werkzeug.wrappers.request.Request
+        :type auth: str
+        :rtype: str
+        """
+        base_url = parse.urlsplit(request.base_url)  # type: parse.SplitResult
+        netloc = '{scheme}://{token}@{domain}/' if 'token' in auth else '{scheme}://{username}:{password}@{domain}/'
+        return netloc.format(domain=base_url.netloc.split('@')[-1].rstrip('/'), **auth, **base_url._asdict())
+
     # Endpoints
 
     def dispatch_index(self, request):  # pylint:disable=unused-argument
@@ -124,10 +140,10 @@ class WsgiApplication(github.GitHub):
         """
         return wrappers.Response(
             self._index_template % {
-                'links': '\n'.join(
-                    '<a href="s%(name)s/">%(name)s</a>' % {'name': repo}
-                    for repo in self.repositories.keys()
-                ),
+                'links': '\n'.join('<a href="%(domain)s%(name)s/">%(name)s</a>' % {
+                    'domain': self._request_domain,
+                    'name': repo,
+                } for repo in self.repositories.keys()),
             },
             mimetype='text/html',
         )
@@ -151,17 +167,17 @@ class WsgiApplication(github.GitHub):
         return wrappers.Response(
             self._repository_template % {
                 'repository_name': repository.name,
-                'links': '\n'.join('<a href="s%(url)s">%(name)s</a>' % item for item in releases),
+                'links': '\n'.join('<a href="%(url)s">%(name)s</a>' % item for item in releases),
             },
             mimetype='text/html',
         )
 
     def _get_repo_releases(self, repository):
         """
-        :type repository: repos.ShortRepository
-        :rtype: (dict[str], ...) | None
+        :type repository: type: github3.repos.repo.repos.ShortRepository
+        :rtype: (dict) | None
         """
-        repo_releases = sorted(repository.releases(), key=lambda item: item.created_at)  # type: [release.Release, ...]
+        repo_releases = sorted(repository.releases(), key=lambda item: item.created_at)  # type: [release.Release]
         if not repo_releases:
             return None
         return (
@@ -172,8 +188,8 @@ class WsgiApplication(github.GitHub):
     def _get_public_repo_releases(self, repository, releases):
         """
         :type repository: type: github3.repos.repo.repos.ShortRepository
-        :type releases: [release.Release, ...]
-        :rtype: (dict[str], ...) | None
+        :type releases: list[github3.repos.release.Release]
+        :rtype: (dict) | None
         """
         return tuple({
             'url': '{url}/archive/{tag_name}.tar.gz'.format(
@@ -186,7 +202,7 @@ class WsgiApplication(github.GitHub):
     def _get_private_repo_releases(self, repository, releases):
         """
         :type repository: type: github3.repos.repo.repos.ShortRepository
-        :type releases: [release.Release, ...]
+        :type releases: list[github3.repos.release.Release]
         :rtype: dict
         """
         raise NotImplementedError
