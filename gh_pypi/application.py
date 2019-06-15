@@ -108,10 +108,12 @@ class WsgiApplication(github.GitHub):
         :raises werkzeug.exceptions.Unauthorized: If authorization information not available in `request`
         """
         auth = request.authorization or {}
-        if not (auth.get('username', None) and auth.get('password', None)):
-            raise exceptions.Unauthorized(www_authenticate='Basic realm=\'Simple index\'')
+        username = auth.get('username', '').strip()
+        password = auth.get('password', '').strip()
+        if not username:
+            raise exceptions.Unauthorized(www_authenticate='Basic realm="Simple index"')
 
-        return auth
+        return {'username': username, 'password': password} if username and password else {'token': username}
 
     # Endpoints
 
