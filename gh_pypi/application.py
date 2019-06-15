@@ -1,54 +1,65 @@
+import collections
+from http import HTTPStatus
 from urllib import parse
 
 from cachelib import FileSystemCache
 from github3 import (
+    GitHub as GitHubApi,
     exceptions as gh_exc,
-    login,
     repos,
 )
 from github3.repos import release
+import requests
 from werkzeug import (
     exceptions,
     routing,
     wrappers,
 )
 
-from . import (
+from gh_pypi import (
     github,
     templates,
 )
+from gh_pypi.stream_response import ResponseStream
 
 __all__ = ('WsgiApplication', )
+
+ASSET_FILENAME = 'pypi.tar.gz'
+CACHE_KEY = 'repositories'
 
 
 # noinspection PyMethodMayBeStatic,PyProtectedMember,PyUnusedLocal,SpellCheckingInspection
 class WsgiApplication(github.GitHub):
-    _urls = routing.Map((
+    _URLS = routing.Map((
         routing.Rule('/', endpoint='index'),
         routing.Rule('/<repository_name>/', endpoint='repository'),
+        routing.Rule('/<repository_name>/release/<release_name>.tar.gz', endpoint='download'),
     ))
 
     _cache = None  # type: FileSystemCache
     _users_and_organizations = None  # type: (github.Organization | github.User, ...)
     _index_template = None  # type: str
     _repository_template = None  # type: str
+    _auth = None  # type: dict[str]
     _request_domain = None  # type: str
+    _request_urls = None  # type: routing.MapAdapter
 
     @property
     def repositories(self):
         """
-        :rtype: dict[repos.ShortRepository]
+        :rtype: dict[str, repos.ShortRepository]
         """
-        value = self._cache.get('repositories')
+        value = self._cache.get(CACHE_KEY)
 
         if value is None:
             data = self.get_installable_repositories(*self._users_and_organizations)
             value = {key: repo._json_data for key, repo in data.items()}  # pylint:disable=protected-access
-            self._cache.set('repositories', value)
+            self._cache.set(CACHE_KEY, value)
             return data
 
         return {key: repos.ShortRepository(json, self.github_api.session) for key, json in value.items()}
 
+    # noinspection PyTypeChecker
     def __init__(
             self,
             *users_and_organizations,
@@ -66,8 +77,11 @@ class WsgiApplication(github.GitHub):
         self._users_and_organizations = users_and_organizations
         self._index_template = index_template or templates.INDEX
         self._repository_template = repository_template or templates.REPOSITORY
-        # noinspection PyTypeChecker
+        self._auth = None
         self._request_domain = None
+        self._request_urls = None
+        self.current_user = None
+        self.github_api = None
 
     def __call__(self, environ, start_response):
         """
@@ -76,13 +90,17 @@ class WsgiApplication(github.GitHub):
         :rtype: werkzeug.wsgi.ClosingIterator
         """
         request = wrappers.Request(environ)
-        try:
-            auth = self._get_authorization(request)
-            self._authorize_github(**auth)
-            self._request_domain = self._get_request_domain(request, **auth)
 
-            adapter = self._urls.bind_to_environ(request.environ)
-            endpoint, values = adapter.match()
+        if b'purge_cache' in request.query_string:
+            self._cache.delete(CACHE_KEY)
+
+        try:
+            self._get_authorization(request)
+            self._authorize_github()
+            self._request_domain = self._get_request_domain(request)
+
+            self._request_urls = self._URLS.bind_to_environ(request.environ)
+            endpoint, values = self._request_urls.match()
 
             func_name = 'dispatch_{}'.format(endpoint)
             response = (
@@ -106,32 +124,66 @@ class WsgiApplication(github.GitHub):
         if not username:
             raise exceptions.Unauthorized(www_authenticate='Basic realm="Simple index"')
 
-        return {'username': username, 'password': password} if username and password else {'token': username}
+        self._auth = {'username': username, 'password': password} if username and password else {'token': username}
 
-    def _authorize_github(self, **auth):
+    def _authorize_github(self):
         """
-        :type auth: str
         :rtype: None
         :raises werkzeug.exceptions.Forbidden: If cannot login to GitHub using `auth` credentials
         """
-        self.github_api = login(**auth)
+        self.github_api = GitHubApi(**self._auth)
         try:
-            if self.github_api.me() is None:
-                raise exceptions.Forbidden()
+            self.current_user = self.github_api.me()
         except gh_exc.AuthenticationFailed:
             raise exceptions.Forbidden()
+        if self.current_user is None:
+            raise exceptions.Forbidden()
 
-    def _get_request_domain(self, request, **auth):
+    def _get_request_domain(self, request):
         """
         :type request: werkzeug.wrappers.request.Request
-        :type auth: str
         :rtype: str
         """
         base_url = parse.urlsplit(request.base_url)  # type: parse.SplitResult
-        netloc = '{scheme}://{token}@{domain}/' if 'token' in auth else '{scheme}://{username}:{password}@{domain}/'
-        return netloc.format(domain=base_url.netloc.split('@')[-1].rstrip('/'), **auth, **base_url._asdict())
+        netloc = (
+            '{scheme}://{token}@{domain}' if 'token' in self._auth
+            else '{scheme}://{username}:{password}@{domain}'
+        )
+
+        format_dict = {'domain': base_url.netloc.split('@')[-1].rstrip('/')}
+        format_dict.update(self._auth)
+        format_dict.update(base_url._asdict())
+
+        return netloc.format(**format_dict)
 
     # Endpoints
+
+    def dispatch_download(self, request, repository_name, release_name):  # pylint:disable=unused-argument
+        repo_releases = self._get_releases(repository_name)
+        if not repo_releases:
+            raise exceptions.NotFound()
+
+        wanted_release = repo_releases[release_name]  # type: release.Release
+        asset_url = None
+        for asset in wanted_release.assets():  # type: release.Asset
+            if asset.name == ASSET_FILENAME:
+                asset_url = '{download_url}?access_token={access_token}'.format(
+                    download_url=asset.download_url,
+                    access_token=self._auth.get('token', self._auth.get('password')),
+                )
+                break
+
+        if not asset_url:
+            raise exceptions.NotFound(
+                'Asset "{}" not found in release "{}"'.format(ASSET_FILENAME, wanted_release.name)
+            )
+
+        with requests.get(asset_url, headers={'Accept': 'application/octet-stream'}, stream=True) as tarball:
+            if tarball.status_code != HTTPStatus.OK:
+                raise exceptions.NotFound()
+
+            stream = ResponseStream(tarball.iter_content(1024))
+            return wrappers.Response(stream.read(), direct_passthrough=True, mimetype='application/x-compressed')
 
     def dispatch_index(self, request):  # pylint:disable=unused-argument
         """
@@ -140,10 +192,11 @@ class WsgiApplication(github.GitHub):
         """
         return wrappers.Response(
             self._index_template % {
-                'links': '\n'.join('<a href="%(domain)s%(name)s/">%(name)s</a>' % {
+                'links': '\n'.join('<a href="%(domain)s%(endpoint)s">%(name)s</a>' % {
                     'domain': self._request_domain,
-                    'name': repo,
-                } for repo in self.repositories.keys()),
+                    'endpoint': self._request_urls.build('repository', {'repository_name': repo_name}),
+                    'name': repo.full_name,
+                } for repo_name, repo in self.repositories.items()),
             },
             mimetype='text/html',
         )
@@ -151,58 +204,53 @@ class WsgiApplication(github.GitHub):
     def dispatch_repository(self, request, repository_name):  # pylint:disable=unused-argument
         """
         :type request: werkzeug.wrappers.request.Request
-        :param repository_name: str
+        :type repository_name: str
         :rtype: werkzeug.wrappers.response.Response
         :raises werkzeug.exceptions.NotFound: If `repository_name` not found on GitHub
+        """
+        releases = self._get_repo_releases_links(repository_name)
+        return wrappers.Response(
+            self._repository_template % {
+                'repository_name': repository_name,
+                'links': '\n'.join('<a href="%(url)s">%(tag_name)s</a>' % item for item in releases),
+            },
+            mimetype='text/html',
+        )
+
+    # Helpers
+
+    def _get_repo_releases_links(self, repository_name):
+        """
+        :type repository_name: str
+        :rtype: (dict[str, str], ...) | None
+        """
+        repo_releases = self._get_releases(repository_name)
+        if not repo_releases:
+            return None
+
+        return tuple({
+            'url': '%(domain)s%(endpoint)s' % {
+                'domain': self._request_domain,
+                'endpoint': self._request_urls.build('download', {
+                    'repository_name': repository_name,
+                    'release_name': tag_name
+                }),
+            },
+            'tag_name': tag_name
+        } for tag_name in repo_releases.keys())
+
+    def _get_releases(self, repository_name):
+        """
+        :type repository_name: str
+        :rtype: dict[str, release.Release] | None
         """
         try:
             repository = self.repositories[repository_name]  # type: repos.ShortRepository
         except KeyError:
             raise exceptions.NotFound()
 
-        releases = self._get_repo_releases(repository)
-        if not releases:
-            return wrappers.Response('No releases available for this repository', mimetype='text/html')
-
-        return wrappers.Response(
-            self._repository_template % {
-                'repository_name': repository.name,
-                'links': '\n'.join('<a href="%(url)s">%(name)s</a>' % item for item in releases),
-            },
-            mimetype='text/html',
+        repo_releases = collections.OrderedDict(
+            (item.tag_name, item)
+            for item in sorted(repository.releases(), key=lambda item: item.created_at)
         )
-
-    def _get_repo_releases(self, repository):
-        """
-        :type repository: type: github3.repos.repo.repos.ShortRepository
-        :rtype: (dict) | None
-        """
-        repo_releases = sorted(repository.releases(), key=lambda item: item.created_at)  # type: [release.Release]
-        if not repo_releases:
-            return None
-        return (
-            self._get_private_repo_releases(repository, repo_releases) if repository.private
-            else self._get_public_repo_releases(repository, repo_releases)
-        )
-
-    def _get_public_repo_releases(self, repository, releases):
-        """
-        :type repository: type: github3.repos.repo.repos.ShortRepository
-        :type releases: list[github3.repos.release.Release]
-        :rtype: (dict) | None
-        """
-        return tuple({
-            'url': '{url}/archive/{tag_name}.tar.gz'.format(
-                url=repository.html_url.rstrip('/'),
-                tag_name=item.tag_name,
-            ),
-            'name': item.tag_name
-        } for item in releases)
-
-    def _get_private_repo_releases(self, repository, releases):
-        """
-        :type repository: type: github3.repos.repo.repos.ShortRepository
-        :type releases: list[github3.repos.release.Release]
-        :rtype: dict
-        """
-        raise NotImplementedError
+        return repo_releases or None

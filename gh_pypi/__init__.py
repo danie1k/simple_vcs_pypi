@@ -8,8 +8,8 @@ __all__ = (
     'User',
 )
 
-from .application import WsgiApplication
 from .github import (
     Organization,
     User,
 )
+from .application import WsgiApplication
