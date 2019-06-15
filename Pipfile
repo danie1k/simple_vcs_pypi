@@ -9,7 +9,6 @@ flake8-isort = "*"
 isort = "*"
 pycodestyle = "*"
 pylint = "*"
-yapf = "*"
 
 [packages]
 cachelib = "*"
