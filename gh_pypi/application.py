@@ -232,8 +232,13 @@ class WsgiApplication(github.GitHub):  # pylint:disable=too-many-instance-attrib
         :type repository_name: str
         :rtype: dict[str, release.Release] | None
         """
+        repositories_with_aliases = {}
+        for key, value in self.repositories.items():
+            repositories_with_aliases[key] = value
+            repositories_with_aliases[key.replace('_', '-')] = value
+
         try:
-            repository = self.repositories[repository_name]  # type: repos.ShortRepository
+            repository = repositories_with_aliases[repository_name]  # type: repos.ShortRepository
         except KeyError:
             raise exceptions.NotFound()
 
