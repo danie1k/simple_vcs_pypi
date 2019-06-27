@@ -16,11 +16,11 @@ from werkzeug import (
     wrappers,
 )
 
-from gh_pypi import (
+from simple_vcs_pypi import (
     github,
     templates,
 )
-from gh_pypi.stream_response import ResponseStream
+from simple_vcs_pypi.stream_response import ResponseStream
 
 __all__ = ('WsgiApplication', )
 

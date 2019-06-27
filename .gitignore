@@ -132,6 +132,6 @@ dmypy.json
 .idea/
 *.iml
 
-gh_pypi/cache/
+simple_vcs_pypi/cache/
 
 !/**/.gitkeep

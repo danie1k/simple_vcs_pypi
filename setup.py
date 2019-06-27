@@ -6,22 +6,22 @@ from setuptools import setup
 current_dir = os.path.abspath(os.path.dirname(__file__))
 _version_re = re.compile(r'__version__\s+=\s+(?P<version>.*)')
 
-with open(os.path.join(current_dir, 'gh_pypi', '__init__.py'), 'r') as f:
+with open(os.path.join(current_dir, 'simple_vcs_pypi', '__init__.py'), 'r') as f:
     version = _version_re.search(f.read()).group('version')
     version = str(ast.literal_eval(version))
 
 
 setup(
-    name='gh_pypi',
+    name='simple_vcs_pypi',
     license='MIT',
     version=version,
-    description='GitHub-hosted Simple PyPi Index WSGI Application',
+    description='Host your PyPi packages directly on popular VCS servers!',
     long_description=open('README.rst').read(),
     author='Daniel Kuruc',
     author_email='daniel@kurur.dev',
     url='https://github.com/danie1k/github_hosted_pypi',
     py_modules=[
-        'gh_pypi',
+        'simple_vcs_pypi',
     ],
     zip_safe=False,
     python_requires='>=3.4',
